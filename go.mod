@@ -3,8 +3,13 @@ module github.com/max-hoffman/window-frames-toy
 go 1.17
 
 require (
+	github.com/dolthub/go-mysql-server v0.11.0
+	github.com/stretchr/testify v1.7.0
+)
+
+require (
 	github.com/cespare/xxhash v1.1.0 // indirect
-	github.com/dolthub/go-mysql-server v0.11.0 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dolthub/vitess v0.0.0-20211013185428-a8845fb919c1 // indirect
 	github.com/go-kit/kit v0.9.0 // indirect
 	github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b // indirect
@@ -27,4 +32,5 @@ require (
 	google.golang.org/genproto v0.0.0-20190926190326-7ee9db18f195 // indirect
 	google.golang.org/grpc v1.27.0 // indirect
 	gopkg.in/src-d/go-errors.v1 v1.0.0 // indirect
+	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c // indirect
 )

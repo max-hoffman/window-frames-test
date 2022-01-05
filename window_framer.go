@@ -8,14 +8,33 @@ import (
 )
 
 type window struct {
-	blocks []windowBlock
+	blocks []*windowBlock
 }
 
-func (w *window) shortEval(input windowBuffer) {
-	output := make(windowBuffer, 0)
+func (w *window) withInput(buf windowBuffer) *window {
+	//newBlocks := make([]windowBlock, 0)
+	for _, b := range w.blocks {
+		b.withInput(buf)
+	}
+	return w
+}
+
+func (w *window) withOutput(buf windowBuffer) *window {
+	outputIdx := 0
+	for _, b := range w.blocks {
+		lenBlock := len(b.windowAggs)
+		blockIdxs := make([]int, lenBlock)
+		for i := outputIdx; i < lenBlock + outputIdx; i++ {
+			blockIdxs[i-outputIdx] = i
+		}
+
+		b.withOutput(buf, blockIdxs)
+	}
+	return w
+}
+
+func (w *window) shortEval() {
 	for _, block := range w.blocks {
-		block.input = input
-		block.output = output
 		block.shortEval()
 	}
 }
@@ -46,19 +65,20 @@ func newWindowBlock(partitionBy []sql.Expression, sortBy sql.SortFields, aggs []
 	}
 }
 
-func (w *windowBlock) withInput(buf windowBuffer) {
+func (w *windowBlock) withInput(buf windowBuffer) *windowBlock {
 	w.input = buf
+	return w
 }
 
-func (w *windowBlock) withOutput(buf windowBuffer, outputIdx []int) {
+func (w *windowBlock) withOutput(buf windowBuffer, outputIdx []int) *windowBlock {
 	w.output = buf
+	w.outputIdx = outputIdx
+	return w
 }
 
 func (w *windowBlock) shortEval() {
 	// sort buffer
 	w.initializeInputBuffer(sql.NewEmptyContext())
-
-	// identify partitions
 
 	// perform aggregations
 	for _, part := range w.partitions {
@@ -73,9 +93,9 @@ func (w *windowBlock) shortEval() {
 		for j := part.start; j < part.end; j++ {
 			for k, agg := range w.windowAggs {
 				interval, _ := w.framers[k].next()
-				res := agg.compute(interval)
+				res := agg.compute(interval, w.input)
 				outputIdx := w.outputIdx[k]
-				w.output[outputIdx] = sql.NewRow(res)
+				w.output[outputIdx] = append(w.output[outputIdx], res)
 			}
 		}
 	}
@@ -92,7 +112,47 @@ func partitionsToSortFields(partitionExprs []sql.Expression) sql.SortFields {
 	return sfs
 }
 
-// initializeInputBuffer sorts the buffer by (WPK, WSK)
+func isNewPartition(ctx *sql.Context, partitionBy []sql.Expression, last sql.Row, row sql.Row) (bool, error) {
+	if len(last) == 0 {
+		return true, nil
+	}
+
+	if len(partitionBy) == 0 {
+		return false, nil
+	}
+
+	lastExp, err := evalExprs(ctx, partitionBy, last)
+	if err != nil {
+		return false, err
+	}
+
+	thisExp, err := evalExprs(ctx, partitionBy, row)
+	if err != nil {
+		return false, err
+	}
+
+	for i := range lastExp {
+		if lastExp[i] != thisExp[i] {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func evalExprs(ctx *sql.Context, exprs []sql.Expression, row sql.Row) (sql.Row, error) {
+	result := make(sql.Row, len(exprs))
+	for i, expr := range exprs {
+		var err error
+		result[i], err = expr.Eval(ctx, row)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+	// initializeInputBuffer sorts the buffer by (WPK, WSK)
 // if the block is not unordered
 func (w *windowBlock) initializeInputBuffer(ctx *sql.Context) {
 	sorter := &expression.Sorter{
@@ -101,6 +161,25 @@ func (w *windowBlock) initializeInputBuffer(ctx *sql.Context) {
 		Ctx:        ctx,
 	}
 	sort.Stable(sorter)
+
+	w.partitions = make([]windowInterval, 0)
+	startIdx := 0
+	var lastRow sql.Row
+	for i, row := range w.input {
+		ok, err := isNewPartition(sql.NewEmptyContext(), w.partitionBy, lastRow, row)
+		if err != nil {
+
+		}
+		if ok && i > startIdx {
+			w.partitions = append(w.partitions, windowInterval{start: startIdx , end: i})
+			startIdx = i
+		}
+		lastRow = row
+	}
+
+	if startIdx < len(w.input) {
+		w.partitions = append(w.partitions, windowInterval{start: startIdx, end: len(w.input)})
+	}
 }
 
 // Every windowAgg in a block reuses the same buffer.
@@ -118,7 +197,7 @@ type windowAgg interface {
 	// and previous states
 	newSlidingFrameInterval(added, dropped windowInterval)
 	//
-	compute(windowInterval) interface{}
+	compute(windowInterval, windowBuffer) interface{}
 }
 
 var _ windowAgg = (*windowSumAgg)(nil)
@@ -150,10 +229,10 @@ func (s *windowSumAgg) newSlidingFrameInterval(added, dropped windowInterval) {
 	return
 }
 
-func (s *windowSumAgg) compute(interval windowInterval) interface{} {
+func (s *windowSumAgg) compute(interval windowInterval, buf windowBuffer) interface{} {
 	var res int
 	for i := interval.start; i < interval.end; i++ {
-		val, _ := s.expr.Eval(sql.NewEmptyContext(), s.buf[i])
+		val, _ := s.expr.Eval(sql.NewEmptyContext(), buf[i])
 		res += val.(int)
 	}
 	return res
@@ -172,7 +251,7 @@ func (s *windowFirstAgg) newSlidingFrameInterval(added, dropped windowInterval) 
 	return
 }
 
-func (s *windowFirstAgg) compute(interval windowInterval) interface{} {
+func (s *windowFirstAgg) compute(interval windowInterval, buf windowBuffer) interface{} {
 	return s.partitionStart
 }
 
@@ -233,20 +312,17 @@ func (r *rowsWindowFramer) next() (windowInterval, error) {
 	}
 
 	r.frameSet = false
-	defer func() {r.frameSet = true}()
-
-	if r.frameStart == -1 {
-		r.frameStart = r.partitionStart
-		r.frameEnd = r.partitionStart + r.followOffset
-		return r.frameInterval()
-	}
+	defer func() {
+		r.frameSet = true
+		r.idx++
+	}()
 
 	newStart := r.idx - r.precOffset
-	if newStart < 0 {
-		newStart = 0
+	if newStart < r.partitionStart {
+		newStart = r.partitionStart
 	}
 
-	newEnd := r.idx + r.precOffset
+	newEnd := r.idx + r.followOffset + 1
 	if newEnd > r.partitionEnd {
 		newEnd = r.partitionEnd
 	}
@@ -277,11 +353,10 @@ func (r *rowsWindowFramer) close() {
 	panic("implement me")
 }
 
-// range for
+// [start, end) range, where [start] is inclusive, and [end] is exclusive
 type windowInterval struct {
     start, end int
 }
-
 
 func main() {
 
